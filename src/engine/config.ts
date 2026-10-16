@@ -38,4 +38,5 @@ export const CONFIG = {
   gridSpacing: 8, // m
   startDelay: [0.1, 0.6] as [number, number], // s, scaled by (1.2 - consistency/100)
   teamOrderRange: 2.0, // s
+  yieldSlowdown: 0.08, // the yielding car runs this much slower until the teammate is through
 } as const;

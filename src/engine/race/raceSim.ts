@@ -185,17 +185,23 @@ export class RaceSim implements SessionSim {
    * Cars cannot occupy the same piece of road. `order` is the pre-move ranking: any follower that
    * reached (or jumped past) the car in front is either granted a pass or held back.
    */
-  protected resolveContacts(order: CarState[]): void {
+  protected resolveContacts(allOrder: CarState[]): void {
+    // Pit-lane, finished and retired cars take no part in track contact.
+    const order = allOrder.filter((c) => c.status === 'running');
     for (let i = 1; i < order.length; i++) {
       const a = order[i - 1];
       const b = order[i];
-      if (a.status !== 'running' || b.status !== 'running') continue;
       const da = this.totalDist(a);
       const db = this.totalDist(b);
 
-      if (a.yieldTo === b.entry.carId && this.onStraight(b)) {
-        a.yieldTo = null;
-        if (this.passAhead(b, a)) continue;
+      if (a.yieldTo === b.entry.carId) {
+        const gap = (da - db) / this.refSpeed();
+        if (gap > CONFIG.teamOrderRange * 2) {
+          a.yieldTo = null; // the teammate fell away; stop lifting
+        } else if (db > da - CONFIG.heldGapMeters && this.onStraight(b)) {
+          a.yieldTo = null;
+          if (this.passAhead(b, a)) continue;
+        }
       }
       if (db <= da - CONFIG.heldGapMeters) continue;
 
@@ -332,7 +338,7 @@ export class RaceSim implements SessionSim {
         gapAhead,
         noise: this.rng.normal(),
       });
-      const speed = segment.length / time;
+      const speed = segment.length / (car.yieldTo ? time * (1 + CONFIG.yieldSlowdown) : time);
       const toEnd = segEnd - car.lapDist;
       const timeToEnd = toEnd / speed;
       const pitEntry = this.circuit.pitEntry;
@@ -360,6 +366,7 @@ export class RaceSim implements SessionSim {
 
   protected enterPit(car: CarState, tEnter: number): void {
     car.status = 'pitting';
+    car.yieldTo = null;
     car.inPitLane = true;
     car.pitElapsed = 0;
     car.pitTotal = pitTraverseTime(this.circuit, rollStopTime(this.rng));
@@ -380,8 +387,9 @@ export class RaceSim implements SessionSim {
       const tCross = car.pitEnterTime + car.pitTotal * ((this.lapLen - this.circuit.pitEntry) / laneDist);
       this.crossLine(car, tCross);
       if (car.status === 'finished') {
+        // The stop was taken even though the flag fell inside the pit lane.
+        this.applyTyreChange(car);
         car.inPitLane = false;
-        car.pitRequest = null;
         return 0;
       }
     }
@@ -390,12 +398,18 @@ export class RaceSim implements SessionSim {
     return remaining - used;
   }
 
-  protected exitPit(car: CarState): void {
+  /** Fits the requested compound (fresh tyres) and records it as used. */
+  protected applyTyreChange(car: CarState): Compound {
     const next = car.pitRequest ?? car.compound;
     car.compound = next;
     car.wear = 0;
     if (!car.used.includes(next)) car.used.push(next);
     car.pitRequest = null;
+    return next;
+  }
+
+  protected exitPit(car: CarState): void {
+    const next = this.applyTyreChange(car);
     car.status = 'running';
     car.inPitLane = false;
     car.lapDist = this.circuit.pitExit;
