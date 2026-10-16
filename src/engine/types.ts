@@ -136,3 +136,7 @@ export interface SessionSim {
   isFinished(): boolean;
   result(): SessionResult;
 }
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** A command without its tick; the sim/store stamps the tick. (Omit<Command,'tick'> would collapse the union.) */
+export type CommandInput = DistributiveOmit<Command, 'tick'>;

@@ -38,3 +38,5 @@ export function runToEnd(sim: RaceSim, maxSteps = 20000): number {
   }
   return n;
 }
+
+export const allAi = (entries: RaceEntry[]): string[] => entries.map((e) => e.carId);

@@ -29,6 +29,7 @@ export const CONFIG = {
   overtakeDifficultyK: 0.3,
   overtakeClamp: [0.05, 0.95] as [number, number],
   heldGapMeters: 8,
+  passMargin: 2, // m a car is placed ahead of the one it passes
 
   pitStopTime: [2.2, 3.0] as [number, number], // s
   slowStopChance: 0.05,

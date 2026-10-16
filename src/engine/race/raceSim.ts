@@ -16,6 +16,8 @@ import type {
   SessionSnapshot,
 } from '../types';
 import { segmentTime, wearPerLap } from './laptime';
+import { aiCommands, planOneStop, type OneStopPlan } from '../ai/simpleStrategy';
+import { overtakeChance } from './overtake';
 import { pitLaneDistance, pitTraverseTime, rollStopTime } from './pit';
 import { sortResults, violatesCompoundRule } from './rules';
 
@@ -50,6 +52,8 @@ interface CarState {
   pitTotal: number;
   pitEnterTime: number;
   pitCrossed: boolean;
+  lastAttempt: string | null;
+  plan: OneStopPlan | null;
 }
 
 const MAX_EVENTS = 50;
@@ -84,6 +88,8 @@ export class RaceSim implements SessionSim {
       if (gridIndex < 0) throw new Error(`car ${entry.carId} missing from grid`);
       const onLine = gridIndex === 0;
       const consistency = entry.driver.consistency;
+      const plan = opts.aiCarIds.includes(entry.carId) ? planOneStop(this.lapsTotal, this.rng) : null;
+      const startCompound = plan ? plan.startCompound : entry.startCompound;
       return {
         entry,
         gridIndex,
@@ -91,9 +97,9 @@ export class RaceSim implements SessionSim {
         lapsCompleted: onLine ? 0 : -1,
         lapDist: onLine ? 0 : this.lapLen - gridIndex * CONFIG.gridSpacing,
         startDelay: this.rng.range(CONFIG.startDelay[0], CONFIG.startDelay[1]) * (1.2 - consistency / 100),
-        compound: entry.startCompound,
+        compound: startCompound,
         wear: 0,
-        used: [entry.startCompound],
+        used: [startCompound],
         pace: 'normal' as PaceMode,
         pitRequest: null,
         inPitLane: false,
@@ -107,6 +113,8 @@ export class RaceSim implements SessionSim {
         pitTotal: 0,
         pitEnterTime: 0,
         pitCrossed: false,
+        lastAttempt: null,
+        plan,
       };
     });
   }
@@ -124,6 +132,7 @@ export class RaceSim implements SessionSim {
   }
 
   step(): void {
+    this.runAi();
     this.applyCommands();
     this.tick += 1;
     const t0 = (this.tick - 1) * CONFIG.tickSeconds;
@@ -132,6 +141,90 @@ export class RaceSim implements SessionSim {
     for (const car of order) {
       if (car.status === 'running' || car.status === 'pitting') this.advance(car, t0, gaps.get(car) ?? null);
     }
+    this.resolveContacts(order);
+  }
+
+  /** AI cars decide once per simulated second. */
+  protected runAi(): void {
+    if (this.tick % 4 !== 0 || this.aiCarIds.length === 0) return;
+    const snap = this.snapshot();
+    for (const c of snap.cars) {
+      const plan = this.cars.find((x) => x.entry.carId === c.carId)?.plan;
+      if (!plan) continue;
+      for (const cmd of aiCommands(c, plan)) this.enqueue({ ...cmd, tick: this.tick } as Command);
+    }
+  }
+
+  protected onStraight(car: CarState): boolean {
+    return this.circuit.segments[segmentAt(this.circuit, car.lapDist).index].type === 'straight';
+  }
+
+  /** Expected lap time at the car's current tyres/pace, with no traffic and no noise. */
+  protected expectedLapTime(car: CarState): number {
+    let total = 0;
+    for (const segment of this.circuit.segments) {
+      total += segmentTime({
+        segment,
+        lapBaseTime: this.lapTime0,
+        car: car.entry.car,
+        driver: car.entry.driver,
+        setup: car.entry.setup,
+        optimalSetup: this.opt,
+        compound: car.compound,
+        wear: car.wear,
+        raceProgress: this.progress(car),
+        pace: car.pace,
+        gapAhead: null,
+        noise: 0,
+      });
+    }
+    return total;
+  }
+
+  /**
+   * Cars cannot occupy the same piece of road. `order` is the pre-move ranking: any follower that
+   * reached (or jumped past) the car in front is either granted a pass or held back.
+   */
+  protected resolveContacts(order: CarState[]): void {
+    for (let i = 1; i < order.length; i++) {
+      const a = order[i - 1];
+      const b = order[i];
+      if (a.status !== 'running' || b.status !== 'running') continue;
+      const da = this.totalDist(a);
+      const db = this.totalDist(b);
+
+      if (a.yieldTo === b.entry.carId && this.onStraight(b)) {
+        a.yieldTo = null;
+        if (this.passAhead(b, a)) continue;
+      }
+      if (db <= da - CONFIG.heldGapMeters) continue;
+
+      if (this.onStraight(b) && (da - db) / this.refSpeed() <= CONFIG.overtakeWindow) {
+        const key = `${a.entry.carId}:${b.lapsCompleted}:${segmentAt(this.circuit, b.lapDist).index}`;
+        if (b.lastAttempt !== key) {
+          b.lastAttempt = key;
+          const delta = this.expectedLapTime(a) - this.expectedLapTime(b);
+          const p = overtakeChance(delta, b.entry.driver.attack, a.entry.driver.defense, this.circuit.traits.overtakeDifficulty);
+          if (this.rng.chance(p) && this.passAhead(b, a)) continue;
+        }
+      }
+      this.holdBehind(b, da);
+    }
+  }
+
+  /** Completes a pass by placing `b` just in front of `a`; refuses if that would cross a timing line. */
+  protected passAhead(b: CarState, a: CarState): boolean {
+    const target = this.totalDist(a) + CONFIG.passMargin;
+    if (Math.floor(target / this.lapLen) !== b.lapsCompleted) return false;
+    b.lapDist = target - b.lapsCompleted * this.lapLen;
+    this.pushEvent(b, `${this.lapOf(b)}랩: ${b.entry.carId} → ${a.entry.carId} 추월`);
+    return true;
+  }
+
+  /** Put `car` heldGapMeters behind a car at distance `aheadDist`, never back across a line it already crossed. */
+  protected holdBehind(car: CarState, aheadDist: number): void {
+    const target = Math.max(aheadDist - CONFIG.heldGapMeters, car.lapsCompleted * this.lapLen);
+    car.lapDist = target - car.lapsCompleted * this.lapLen;
   }
 
   protected applyCommands(): void {
