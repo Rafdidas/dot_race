@@ -16,6 +16,7 @@ import type {
   SessionSnapshot,
 } from '../types';
 import { segmentTime, wearPerLap } from './laptime';
+import { pitLaneDistance, pitTraverseTime, rollStopTime } from './pit';
 import { sortResults, violatesCompoundRule } from './rules';
 
 export interface RaceSimOptions {
@@ -45,6 +46,10 @@ interface CarState {
   finishTime: number | null;
   finishedLaps: number;
   yieldTo: string | null;
+  pitElapsed: number;
+  pitTotal: number;
+  pitEnterTime: number;
+  pitCrossed: boolean;
 }
 
 const MAX_EVENTS = 50;
@@ -98,6 +103,10 @@ export class RaceSim implements SessionSim {
         finishTime: null,
         finishedLaps: 0,
         yieldTo: null,
+        pitElapsed: 0,
+        pitTotal: 0,
+        pitEnterTime: 0,
+        pitCrossed: false,
       };
     });
   }
@@ -115,12 +124,47 @@ export class RaceSim implements SessionSim {
   }
 
   step(): void {
+    this.applyCommands();
     this.tick += 1;
     const t0 = (this.tick - 1) * CONFIG.tickSeconds;
     const order = this.ranked();
     const gaps = this.gapsAhead(order);
     for (const car of order) {
-      if (car.status === 'running') this.advance(car, t0, gaps.get(car) ?? null);
+      if (car.status === 'running' || car.status === 'pitting') this.advance(car, t0, gaps.get(car) ?? null);
+    }
+  }
+
+  protected applyCommands(): void {
+    if (this.queue.length === 0) return;
+    const due = this.queue.filter((c) => c.tick <= this.tick);
+    if (due.length === 0) return;
+    this.queue = this.queue.filter((c) => c.tick > this.tick);
+    for (const cmd of due) this.applyCommand(cmd);
+  }
+
+  protected applyCommand(cmd: Command): void {
+    const car = this.cars.find((c) => c.entry.carId === cmd.carId);
+    if (!car) return;
+    switch (cmd.kind) {
+      case 'pit':
+        if (car.status === 'running') car.pitRequest = cmd.compound;
+        break;
+      case 'pace':
+        if (car.status === 'running' || car.status === 'pitting') car.pace = cmd.mode;
+        break;
+      case 'teamOrder': {
+        if (car.status !== 'running') break;
+        const order = this.ranked();
+        const mate = order[order.indexOf(car) + 1];
+        const interval = mate ? (this.totalDist(car) - this.totalDist(mate)) / this.refSpeed() : Infinity;
+        if (mate && mate.entry.teamId === car.entry.teamId && mate.status === 'running' && interval <= CONFIG.teamOrderRange) {
+          car.yieldTo = mate.entry.carId;
+          this.pushEvent(car, `${car.entry.carId} → ${mate.entry.carId} 양보 지시`);
+        } else {
+          this.pushEvent(car, `${car.entry.carId} 팀 오더 불가`);
+        }
+        break;
+      }
     }
   }
 
@@ -152,12 +196,14 @@ export class RaceSim implements SessionSim {
   protected gapsAhead(order: CarState[]): Map<CarState, number | null> {
     const gaps = new Map<CarState, number | null>();
     for (let i = 0; i < order.length; i++) {
-      const ahead = order[i - 1];
-      if (!ahead || ahead.status !== 'running') {
-        gaps.set(order[i], null);
-      } else {
-        gaps.set(order[i], (this.totalDist(ahead) - this.totalDist(order[i])) / this.refSpeed());
+      let ahead: CarState | undefined;
+      for (let j = i - 1; j >= 0; j--) {
+        if (order[j].status === 'running') {
+          ahead = order[j];
+          break;
+        }
       }
+      gaps.set(order[i], ahead ? (this.totalDist(ahead) - this.totalDist(order[i])) / this.refSpeed() : null);
     }
     return gaps;
   }
@@ -170,8 +216,12 @@ export class RaceSim implements SessionSim {
       remaining -= used;
     }
     let guard = 0;
-    while (remaining > 1e-9 && car.status === 'running') {
+    while (remaining > 1e-9 && (car.status === 'running' || car.status === 'pitting')) {
       if (guard++ > MAX_SEGMENTS_PER_TICK) throw new Error('advance: runaway segment loop');
+      if (car.status === 'pitting') {
+        remaining = this.advancePit(car, remaining);
+        continue;
+      }
       const { index, start } = segmentAt(this.circuit, car.lapDist);
       const segment = this.circuit.segments[index];
       const segEnd = start + segment.length;
@@ -192,6 +242,15 @@ export class RaceSim implements SessionSim {
       const speed = segment.length / time;
       const toEnd = segEnd - car.lapDist;
       const timeToEnd = toEnd / speed;
+      const pitEntry = this.circuit.pitEntry;
+      if (car.pitRequest !== null && car.lapDist <= pitEntry && pitEntry <= car.lapDist + Math.min(speed * remaining, toEnd)) {
+        const d = pitEntry - car.lapDist;
+        this.move(car, d);
+        car.lapDist = pitEntry;
+        remaining -= d / speed;
+        this.enterPit(car, t0 + (CONFIG.tickSeconds - remaining));
+        continue;
+      }
       if (remaining < timeToEnd) {
         this.move(car, speed * remaining);
         remaining = 0;
@@ -204,6 +263,50 @@ export class RaceSim implements SessionSim {
         }
       }
     }
+  }
+
+  protected enterPit(car: CarState, tEnter: number): void {
+    car.status = 'pitting';
+    car.inPitLane = true;
+    car.pitElapsed = 0;
+    car.pitTotal = pitTraverseTime(this.circuit, rollStopTime(this.rng));
+    car.pitEnterTime = tEnter;
+    car.pitCrossed = false;
+    this.pushEvent(car, `${car.entry.carId} 피트인`);
+  }
+
+  /** Advances a car along the pit lane; returns the tick time left over. */
+  protected advancePit(car: CarState, remaining: number): number {
+    const used = Math.min(remaining, car.pitTotal - car.pitElapsed);
+    car.pitElapsed += used;
+    const f = car.pitTotal > 0 ? Math.min(1, car.pitElapsed / car.pitTotal) : 1;
+    const laneDist = pitLaneDistance(this.circuit);
+    const pos = this.circuit.pitEntry + laneDist * f;
+    if (!car.pitCrossed && pos >= this.lapLen) {
+      car.pitCrossed = true;
+      const tCross = car.pitEnterTime + car.pitTotal * ((this.lapLen - this.circuit.pitEntry) / laneDist);
+      this.crossLine(car, tCross);
+      if (car.status === 'finished') {
+        car.inPitLane = false;
+        car.pitRequest = null;
+        return 0;
+      }
+    }
+    car.lapDist = car.pitCrossed ? pos - this.lapLen : pos;
+    if (car.pitElapsed >= car.pitTotal - 1e-9) this.exitPit(car);
+    return remaining - used;
+  }
+
+  protected exitPit(car: CarState): void {
+    const next = car.pitRequest ?? car.compound;
+    car.compound = next;
+    car.wear = 0;
+    if (!car.used.includes(next)) car.used.push(next);
+    car.pitRequest = null;
+    car.status = 'running';
+    car.inPitLane = false;
+    car.lapDist = this.circuit.pitExit;
+    this.pushEvent(car, `${car.entry.carId} 피트 완료 (${next})`);
   }
 
   protected progress(car: CarState): number {
