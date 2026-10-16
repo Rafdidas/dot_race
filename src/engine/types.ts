@@ -61,3 +61,78 @@ export interface Circuit {
   pitEntry: number;
   pitExit: number;
 }
+
+export interface RaceEntry {
+  carId: string;
+  teamId: string;
+  car: CarStats;
+  driver: DriverStats;
+  setup: number;
+  startCompound: Compound;
+}
+
+export type Command =
+  | { tick: number; carId: string; kind: 'pit'; compound: Compound }
+  | { tick: number; carId: string; kind: 'pace'; mode: PaceMode }
+  | { tick: number; carId: string; kind: 'teamOrder' }; // carId yields to its teammate
+
+export type CarStatus = 'running' | 'pitting' | 'retired' | 'finished';
+
+export interface CarSnapshot {
+  carId: string;
+  teamId: string;
+  position: number;
+  status: CarStatus;
+  lap: number;
+  totalDist: number;
+  lapDist: number;
+  inPitLane: boolean;
+  compound: Compound;
+  wear: number;
+  usedCompounds: Compound[];
+  pace: PaceMode;
+  pitRequest: Compound | null;
+  gapToLeader: number; // seconds
+  interval: number; // seconds to the car ahead
+  lastLap: number | null;
+  bestLap: number | null;
+}
+
+export interface RaceEvent {
+  tick: number;
+  lap: number;
+  text: string;
+}
+
+export interface SessionSnapshot {
+  tick: number;
+  time: number;
+  lapsTotal: number;
+  leaderLap: number;
+  cars: CarSnapshot[];
+  events: RaceEvent[];
+  finished: boolean;
+}
+
+export interface ResultRow {
+  carId: string;
+  teamId: string;
+  position: number;
+  laps: number;
+  time: number | null;
+  status: 'finished' | 'retired' | 'dsq';
+  bestLap: number | null;
+  usedCompounds: Compound[];
+}
+
+export interface SessionResult {
+  rows: ResultRow[];
+}
+
+export interface SessionSim {
+  step(): void;
+  enqueue(cmd: Command): void;
+  snapshot(): SessionSnapshot;
+  isFinished(): boolean;
+  result(): SessionResult;
+}
